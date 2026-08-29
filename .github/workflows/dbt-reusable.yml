@@ -1,0 +1,92 @@
+# ============================================================
+# REUSABLE dbt CI/CD workflow (central actions repo)
+# Called by dbt project repos via workflow_call.
+#
+# - CI  (lint + build DEV)  when caller passes stage: ci
+# - CD  (build PROD)        when caller passes stage: cd
+# ============================================================
+name: Reusable dbt CI/CD
+
+on:
+  workflow_call:
+    inputs:
+      stage:
+        description: 'Which stage to run: ci (lint+dev) or cd (prod)'
+        required: true
+        type: string
+      python-version:
+        description: 'Python version'
+        required: false
+        type: string
+        default: '3.11'
+      dialect:
+        description: 'SQLFluff dialect'
+        required: false
+        type: string
+        default: 'snowflake'
+    secrets:
+      SNOWFLAKE_ACCOUNT:
+        required: true
+      SNOWFLAKE_USER:
+        required: true
+      SNOWFLAKE_PASSWORD:
+        required: true
+
+jobs:
+  # ---- CI Job 1: Lint (only when stage = ci) ----
+  lint:
+    if: ${{ inputs.stage == 'ci' }}
+    name: Lint YAML + SQL
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+      - name: Install linters
+        run: pip install yamllint sqlfluff
+      - name: YAML Lint
+        run: yamllint -c .yamllint.yml dbt_project.yml profiles.yml
+      - name: SQL Lint
+        run: sqlfluff lint models/ --dialect ${{ inputs.dialect }} --ignore templating || true
+
+  # ---- CI Job 2: Build to DEV (only when stage = ci, after lint) ----
+  build-dev:
+    if: ${{ inputs.stage == 'ci' }}
+    name: dbt build to DEV
+    needs: [lint]
+    runs-on: ubuntu-latest
+    env:
+      DBT_PROFILES_DIR: .
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+      SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+      - name: Install dbt
+        run: pip install dbt-snowflake
+      - name: dbt build (DEV)
+        run: dbt build --target dev
+
+  # ---- CD Job: Build to PROD (only when stage = cd) ----
+  deploy-prod:
+    if: ${{ inputs.stage == 'cd' }}
+    name: dbt build to PROD
+    runs-on: ubuntu-latest
+    env:
+      DBT_PROFILES_DIR: .
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+      SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+      - name: Install dbt
+        run: pip install dbt-snowflake
+      - name: dbt build (PROD)
+        run: dbt build --target prod
