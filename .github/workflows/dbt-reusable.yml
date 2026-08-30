@@ -48,7 +48,7 @@ jobs:
       - name: YAML Lint
         run: yamllint -c .yamllint.yml dbt_project.yml profiles.yml
       - name: SQL Lint
-        run: sqlfluff lint models/ --dialect ${{ inputs.dialect }} --ignore templating || true
+        run: sqlfluff lint models/ --dialect ${{ inputs.dialect }} --ignore templating
 
   # ---- CI Job 2: Build to DEV (only when stage = ci, after lint) ----
   build-dev:
