@@ -1,0 +1,209 @@
+# ============================================================
+# REUSABLE dbt CI/CD workflow — External OAuth
+# Flow: CI (on PR) → DEV + PROD (on merge)
+#
+# HOW OAUTH WORKS HERE:
+#   1. Fetch OAuth token using CLIENT_ID + CLIENT_SECRET
+#      (client_credentials grant — machine to machine)
+#   2. Pass token to dbt via SNOWFLAKE_OAUTH_TOKEN env var
+#   3. dbt uses authenticator: oauth + token to connect
+#
+#   stage: ci → lint + dbt build CI schema
+#   stage: cd → dbt build DEV, then PROD (PROD needs DEV)
+# ============================================================
+name: Reusable dbt OAuth CI/CD
+
+on:
+  workflow_call:
+    inputs:
+      stage:
+        description: 'Which stage: ci (lint+build) or cd (dev+prod)'
+        required: true
+        type: string
+      snowflake-user:
+        description: 'Snowflake service user name for this stage'
+        required: true
+        type: string
+      python-version:
+        required: false
+        type: string
+        default: '3.11'
+      dialect:
+        required: false
+        type: string
+        default: 'snowflake'
+    secrets:
+      SNOWFLAKE_ACCOUNT:
+        required: true
+      SNOWFLAKE_OAUTH_CLIENT_ID:
+        required: true
+      SNOWFLAKE_OAUTH_CLIENT_SECRET:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ============================================================
+  # CI Stage (on PR): Lint + build CI schema
+  # ============================================================
+
+  lint:
+    if: ${{ inputs.stage == 'ci' }}
+    name: Lint YAML + SQL
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+      - name: Install linters
+        run: pip install yamllint sqlfluff
+      - name: YAML Lint
+        run: yamllint -c .yamllint.yml dbt_project.yml profiles.yml
+      - name: SQL Lint
+        run: sqlfluff lint models/ --dialect ${{ inputs.dialect }} --ignore templating
+
+  build-ci:
+    if: ${{ inputs.stage == 'ci' }}
+    name: dbt build (CI schema)
+    needs: [lint]
+    runs-on: ubuntu-latest
+    environment: ci
+    env:
+      DBT_PROFILES_DIR: .
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_USER: ${{ inputs.snowflake-user }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch OAuth token (client_credentials)
+        id: oauth
+        run: |
+          # Exchange CLIENT_ID + CLIENT_SECRET for an OAuth access token
+          # Snowflake External OAuth token endpoint
+          RESPONSE=$(curl -s -X POST \
+            "https://${{ secrets.SNOWFLAKE_ACCOUNT }}.snowflakecomputing.com/oauth/token-request" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "grant_type=client_credentials" \
+            -d "client_id=${{ secrets.SNOWFLAKE_OAUTH_CLIENT_ID }}" \
+            -d "client_secret=${{ secrets.SNOWFLAKE_OAUTH_CLIENT_SECRET }}")
+
+          TOKEN=$(echo "$RESPONSE" | jq -r '.access_token')
+
+          if [ "$TOKEN" = "null" ] || [ -z "$TOKEN" ]; then
+            echo "ERROR: Failed to fetch OAuth token. Response: $RESPONSE"
+            exit 1
+          fi
+
+          echo "::add-mask::$TOKEN"
+          echo "SNOWFLAKE_OAUTH_TOKEN=$TOKEN" >> $GITHUB_ENV
+          echo "OAuth token fetched successfully"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install dbt
+        run: pip install dbt-snowflake
+
+      - name: dbt deps
+        run: dbt deps || true
+
+      - name: dbt build (CI schema)
+        run: dbt build --target ci
+
+  # ============================================================
+  # CD Stage (on merge): DEV first, then PROD
+  # ============================================================
+
+  deploy-dev:
+    if: ${{ inputs.stage == 'cd' }}
+    name: dbt build (DEV schema)
+    runs-on: ubuntu-latest
+    environment: dev
+    env:
+      DBT_PROFILES_DIR: .
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_USER: OAUTH_DEV_SERVICE_USER
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch OAuth token (client_credentials)
+        run: |
+          RESPONSE=$(curl -s -X POST \
+            "https://${{ secrets.SNOWFLAKE_ACCOUNT }}.snowflakecomputing.com/oauth/token-request" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "grant_type=client_credentials" \
+            -d "client_id=${{ secrets.SNOWFLAKE_OAUTH_CLIENT_ID }}" \
+            -d "client_secret=${{ secrets.SNOWFLAKE_OAUTH_CLIENT_SECRET }}")
+
+          TOKEN=$(echo "$RESPONSE" | jq -r '.access_token')
+
+          if [ "$TOKEN" = "null" ] || [ -z "$TOKEN" ]; then
+            echo "ERROR: Failed to fetch OAuth token. Response: $RESPONSE"
+            exit 1
+          fi
+
+          echo "::add-mask::$TOKEN"
+          echo "SNOWFLAKE_OAUTH_TOKEN=$TOKEN" >> $GITHUB_ENV
+          echo "OAuth token fetched successfully"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install dbt
+        run: pip install dbt-snowflake
+
+      - name: dbt deps
+        run: dbt deps || true
+
+      - name: dbt build (DEV schema)
+        run: dbt build --target dev
+
+  deploy-prod:
+    if: ${{ inputs.stage == 'cd' }}
+    name: dbt build (PROD schema)
+    needs: [deploy-dev]              # PROD only runs after DEV succeeds
+    runs-on: ubuntu-latest
+    environment: prod
+    env:
+      DBT_PROFILES_DIR: .
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_USER: OAUTH_PROD_SERVICE_USER
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch OAuth token (client_credentials)
+        run: |
+          RESPONSE=$(curl -s -X POST \
+            "https://${{ secrets.SNOWFLAKE_ACCOUNT }}.snowflakecomputing.com/oauth/token-request" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "grant_type=client_credentials" \
+            -d "client_id=${{ secrets.SNOWFLAKE_OAUTH_CLIENT_ID }}" \
+            -d "client_secret=${{ secrets.SNOWFLAKE_OAUTH_CLIENT_SECRET }}")
+
+          TOKEN=$(echo "$RESPONSE" | jq -r '.access_token')
+
+          if [ "$TOKEN" = "null" ] || [ -z "$TOKEN" ]; then
+            echo "ERROR: Failed to fetch OAuth token. Response: $RESPONSE"
+            exit 1
+          fi
+
+          echo "::add-mask::$TOKEN"
+          echo "SNOWFLAKE_OAUTH_TOKEN=$TOKEN" >> $GITHUB_ENV
+          echo "OAuth token fetched successfully"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install dbt
+        run: pip install dbt-snowflake
+
+      - name: dbt deps
+        run: dbt deps || true
+
+      - name: dbt build (PROD schema)
+        run: dbt build --target prod
