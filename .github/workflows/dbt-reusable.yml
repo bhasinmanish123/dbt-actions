@@ -1,9 +1,8 @@
 # ============================================================
 # REUSABLE dbt CI/CD workflow (central actions repo)
-# Called by dbt project repos via workflow_call.
-#
-# - CI  (lint + build DEV)  when caller passes stage: ci
-# - CD  (build PROD)        when caller passes stage: cd
+# NO PASSWORDS anywhere:
+#   CI  (lint + build DEV) → OIDC oauth token → Snowflake
+#   CD  (build PROD)       → OIDC oauth token → Snowflake
 # ============================================================
 name: Reusable dbt CI/CD
 
@@ -15,12 +14,10 @@ on:
         required: true
         type: string
       python-version:
-        description: 'Python version'
         required: false
         type: string
         default: '3.11'
       dialect:
-        description: 'SQLFluff dialect'
         required: false
         type: string
         default: 'snowflake'
@@ -29,11 +26,15 @@ on:
         required: true
       SNOWFLAKE_USER:
         required: true
-      SNOWFLAKE_PASSWORD:
-        required: true
+      # No SNOWFLAKE_PASSWORD — using OIDC instead
+
+# Required for OIDC token request
+permissions:
+  id-token: write
+  contents: read
 
 jobs:
-  # ---- CI Job 1: Lint (only when stage = ci) ----
+  # ---- CI Job 1: Lint (only when stage = ci, no Snowflake needed) ----
   lint:
     if: ${{ inputs.stage == 'ci' }}
     name: Lint YAML + SQL
@@ -50,7 +51,7 @@ jobs:
       - name: SQL Lint
         run: sqlfluff lint models/ --dialect ${{ inputs.dialect }} --ignore templating
 
-  # ---- CI Job 2: Build to DEV (only when stage = ci, after lint) ----
+  # ---- CI Job 2: Build to DEV (OIDC auth, no password) ----
   build-dev:
     if: ${{ inputs.stage == 'ci' }}
     name: dbt build to DEV
@@ -60,18 +61,29 @@ jobs:
       DBT_PROFILES_DIR: .
       SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
       SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
-      SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ inputs.python-version }}
+
+      # Fetch OIDC token from GitHub and set as env var for dbt
+      - name: Get GitHub OIDC token for Snowflake
+        run: |
+          TOKEN=$(curl -s \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://github.com/bhasinmanish123" \
+            | jq -r '.value')
+          echo "::add-mask::$TOKEN"
+          echo "SNOWFLAKE_OAUTH_TOKEN=$TOKEN" >> $GITHUB_ENV
+
       - name: Install dbt
         run: pip install dbt-snowflake
-      - name: dbt build (DEV)
-        run: dbt build --target dev
 
-  # ---- CD Job: Build to PROD (only when stage = cd) ----
+      - name: dbt build (DEV via OIDC)
+        run: dbt build --target ci
+
+  # ---- CD Job: Build to PROD (OIDC auth, no password) ----
   deploy-prod:
     if: ${{ inputs.stage == 'cd' }}
     name: dbt build to PROD
@@ -80,13 +92,24 @@ jobs:
       DBT_PROFILES_DIR: .
       SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
       SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
-      SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ inputs.python-version }}
+
+      # Fetch OIDC token from GitHub and set as env var for dbt
+      - name: Get GitHub OIDC token for Snowflake
+        run: |
+          TOKEN=$(curl -s \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://github.com/bhasinmanish123" \
+            | jq -r '.value')
+          echo "::add-mask::$TOKEN"
+          echo "SNOWFLAKE_OAUTH_TOKEN=$TOKEN" >> $GITHUB_ENV
+
       - name: Install dbt
         run: pip install dbt-snowflake
-      - name: dbt build (PROD)
+
+      - name: dbt build (PROD via OIDC)
         run: dbt build --target prod
