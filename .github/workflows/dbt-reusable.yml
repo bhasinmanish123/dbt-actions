@@ -1,10 +1,10 @@
 # ============================================================
 # REUSABLE dbt CI/CD workflow (central actions repo)
-# Uses Snowflake Workload Identity Federation (WIF) — no passwords
-# snowflake-cli-action handles OIDC token automatically
+# Uses Snowflake WIF — snowflakedb/snowflake-actions@v3
+# No passwords, no keys — OIDC only
 #
-#   CI (lint + build CI schema)  when stage = ci
-#   CD (build PROD schema)       when stage = cd
+#   CI (lint + dbt build CI schema)  when stage = ci
+#   CD (dbt build PROD schema)       when stage = cd
 # ============================================================
 name: Reusable dbt CI/CD
 
@@ -27,7 +27,6 @@ on:
       SNOWFLAKE_ACCOUNT:
         required: true
 
-# Required for OIDC token request
 permissions:
   id-token: write
   contents: read
@@ -50,28 +49,30 @@ jobs:
       - name: SQL Lint
         run: sqlfluff lint models/ --dialect ${{ inputs.dialect }} --ignore templating
 
-  # ---- CI Job 2: dbt build to CI schema (WIF OIDC) ----
+  # ---- CI Job 2: dbt build to CI schema (WIF) ----
   build-dev:
     if: ${{ inputs.stage == 'ci' }}
     name: dbt build (CI schema)
     needs: [lint]
     runs-on: ubuntu-latest
-    environment: ci-deploy        # MUST match SUBJECT in Snowflake user
+    environment: prod              # MUST match SUBJECT in Snowflake service user
     permissions:
       id-token: write
       contents: read
     env:
       DBT_PROFILES_DIR: .
       SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_CLI_FEATURES_ENABLE_DBT: true
     steps:
       - uses: actions/checkout@v4
 
-      # Snowflake CLI handles OIDC token automatically
-      - name: Setup Snowflake CLI (OIDC)
-        uses: snowflakedb/snowflake-cli-action@v2.0
+      - name: Install Snowflake CLI (OIDC)
+        uses: snowflakedb/snowflake-actions@v3
         with:
           use-oidc: true
-          cli-version: "3.14.0"
+
+      - name: Test Snowflake connection
+        run: snow connection test -x
 
       - uses: actions/setup-python@v5
         with:
@@ -86,27 +87,29 @@ jobs:
       - name: dbt build (CI schema)
         run: dbt build --target ci
 
-  # ---- CD Job: dbt build to PROD schema (WIF OIDC) ----
+  # ---- CD Job: dbt build to PROD schema (WIF) ----
   deploy-prod:
     if: ${{ inputs.stage == 'cd' }}
     name: dbt build (PROD schema)
     runs-on: ubuntu-latest
-    environment: prod-deploy      # MUST match SUBJECT in Snowflake user
+    environment: prod              # MUST match SUBJECT in Snowflake service user
     permissions:
       id-token: write
       contents: read
     env:
       DBT_PROFILES_DIR: .
       SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_CLI_FEATURES_ENABLE_DBT: true
     steps:
       - uses: actions/checkout@v4
 
-      # Snowflake CLI handles OIDC token automatically
-      - name: Setup Snowflake CLI (OIDC)
-        uses: snowflakedb/snowflake-cli-action@v2.0
+      - name: Install Snowflake CLI (OIDC)
+        uses: snowflakedb/snowflake-actions@v3
         with:
           use-oidc: true
-          cli-version: "3.14.0"
+
+      - name: Test Snowflake connection
+        run: snow connection test -x
 
       - uses: actions/setup-python@v5
         with:
