@@ -1,10 +1,10 @@
 # ============================================================
-# REUSABLE dbt CI/CD workflow (central actions repo)
-# Uses Snowflake WIF — snowflakedb/snowflake-actions@v3
-# No passwords, no keys — OIDC only
+# REUSABLE dbt CI/CD workflow
+# Flow: CI (on PR) → DEV + PROD (on merge)
 #
-#   CI (lint + dbt build CI schema)  when stage = ci
-#   CD (dbt build PROD schema)       when stage = cd
+#   stage: ci  → lint + dbt build CI schema  (PR validation)
+#   stage: cd  → dbt build DEV schema        (after merge)
+#              → dbt build PROD schema       (after merge)
 # ============================================================
 name: Reusable dbt CI/CD
 
@@ -12,7 +12,7 @@ on:
   workflow_call:
     inputs:
       stage:
-        description: 'Which stage: ci (lint+build) or cd (prod)'
+        description: 'Which stage: ci (lint+build) or cd (dev+prod)'
         required: true
         type: string
       python-version:
@@ -32,7 +32,10 @@ permissions:
   contents: read
 
 jobs:
-  # ---- CI Job 1: Lint (fast, no Snowflake needed) ----
+  # ============================================================
+  # CI Stage (on PR): Lint + build CI schema
+  # ============================================================
+
   lint:
     if: ${{ inputs.stage == 'ci' }}
     name: Lint YAML + SQL
@@ -49,77 +52,95 @@ jobs:
       - name: SQL Lint
         run: sqlfluff lint models/ --dialect ${{ inputs.dialect }} --ignore templating
 
-  # ---- CI Job 2: dbt build to CI schema (WIF) ----
-  build-dev:
+  build-ci:
     if: ${{ inputs.stage == 'ci' }}
-    name: dbt build (CI schema)
+    name: dbt build (CI schema — validate)
     needs: [lint]
     runs-on: ubuntu-latest
-    environment: prod              # MUST match SUBJECT in Snowflake service user
+    environment: prod
     permissions:
       id-token: write
       contents: read
     env:
       DBT_PROFILES_DIR: .
       SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-      SNOWFLAKE_CLI_FEATURES_ENABLE_DBT: true
     steps:
       - uses: actions/checkout@v4
-
       - name: Install Snowflake CLI (OIDC)
         uses: snowflakedb/snowflake-actions@v3
         with:
           use-oidc: true
-
       - name: Test Snowflake connection
         run: snow connection test -x
-
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ inputs.python-version }}
-
       - name: Install dbt
         run: pip install dbt-snowflake
-
       - name: dbt deps
         run: dbt deps || true
-
       - name: dbt build (CI schema)
         run: dbt build --target ci
 
-  # ---- CD Job: dbt build to PROD schema (WIF) ----
-  deploy-prod:
+  # ============================================================
+  # CD Stage (on merge): build DEV first, then PROD
+  # ============================================================
+
+  deploy-dev:
     if: ${{ inputs.stage == 'cd' }}
-    name: dbt build (PROD schema)
+    name: dbt build (DEV schema)
     runs-on: ubuntu-latest
-    environment: prod              # MUST match SUBJECT in Snowflake service user
+    environment: prod
     permissions:
       id-token: write
       contents: read
     env:
       DBT_PROFILES_DIR: .
       SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-      SNOWFLAKE_CLI_FEATURES_ENABLE_DBT: true
     steps:
       - uses: actions/checkout@v4
-
       - name: Install Snowflake CLI (OIDC)
         uses: snowflakedb/snowflake-actions@v3
         with:
           use-oidc: true
-
       - name: Test Snowflake connection
         run: snow connection test -x
-
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ inputs.python-version }}
-
       - name: Install dbt
         run: pip install dbt-snowflake
-
       - name: dbt deps
         run: dbt deps || true
+      - name: dbt build (DEV schema)
+        run: dbt build --target dev
 
+  deploy-prod:
+    if: ${{ inputs.stage == 'cd' }}
+    name: dbt build (PROD schema)
+    needs: [deploy-dev]              # PROD only runs after DEV succeeds
+    runs-on: ubuntu-latest
+    environment: prod
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      DBT_PROFILES_DIR: .
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Snowflake CLI (OIDC)
+        uses: snowflakedb/snowflake-actions@v3
+        with:
+          use-oidc: true
+      - name: Test Snowflake connection
+        run: snow connection test -x
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+      - name: Install dbt
+        run: pip install dbt-snowflake
+      - name: dbt deps
+        run: dbt deps || true
       - name: dbt build (PROD schema)
         run: dbt build --target prod
