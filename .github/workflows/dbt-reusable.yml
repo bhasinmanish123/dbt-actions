@@ -1,8 +1,10 @@
 # ============================================================
 # REUSABLE dbt CI/CD workflow (central actions repo)
-# NO PASSWORDS anywhere:
-#   CI  (lint + build DEV) → OIDC oauth token → Snowflake
-#   CD  (build PROD)       → OIDC oauth token → Snowflake
+# Uses Snowflake Workload Identity Federation (WIF) — no passwords
+# snowflake-cli-action handles OIDC token automatically
+#
+#   CI (lint + build CI schema)  when stage = ci
+#   CD (build PROD schema)       when stage = cd
 # ============================================================
 name: Reusable dbt CI/CD
 
@@ -10,7 +12,7 @@ on:
   workflow_call:
     inputs:
       stage:
-        description: 'Which stage to run: ci (lint+dev) or cd (prod)'
+        description: 'Which stage: ci (lint+build) or cd (prod)'
         required: true
         type: string
       python-version:
@@ -24,9 +26,6 @@ on:
     secrets:
       SNOWFLAKE_ACCOUNT:
         required: true
-      SNOWFLAKE_USER:
-        required: true
-      # No SNOWFLAKE_PASSWORD — using OIDC instead
 
 # Required for OIDC token request
 permissions:
@@ -34,7 +33,7 @@ permissions:
   contents: read
 
 jobs:
-  # ---- CI Job 1: Lint (only when stage = ci, no Snowflake needed) ----
+  # ---- CI Job 1: Lint (fast, no Snowflake needed) ----
   lint:
     if: ${{ inputs.stage == 'ci' }}
     name: Lint YAML + SQL
@@ -51,77 +50,73 @@ jobs:
       - name: SQL Lint
         run: sqlfluff lint models/ --dialect ${{ inputs.dialect }} --ignore templating
 
-  # ---- CI Job 2: Build to DEV (OIDC auth, no password) ----
+  # ---- CI Job 2: dbt build to CI schema (WIF OIDC) ----
   build-dev:
     if: ${{ inputs.stage == 'ci' }}
-    name: dbt build to DEV
+    name: dbt build (CI schema)
     needs: [lint]
     runs-on: ubuntu-latest
+    environment: ci-deploy        # MUST match SUBJECT in Snowflake user
+    permissions:
+      id-token: write
+      contents: read
     env:
       DBT_PROFILES_DIR: .
       SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-      SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
     steps:
       - uses: actions/checkout@v4
+
+      # Snowflake CLI handles OIDC token automatically
+      - name: Setup Snowflake CLI (OIDC)
+        uses: snowflakedb/snowflake-cli-action@v2.0
+        with:
+          use-oidc: true
+          cli-version: "3.14.0"
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ inputs.python-version }}
 
-      # Fetch OIDC token from GitHub and set as env var for dbt
-      - name: Get GitHub OIDC token for Snowflake
-        run: |
-          TOKEN=$(curl -s \
-            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://github.com/bhasinmanish123" \
-            | jq -r '.value')
-
-          # Decode JWT payload BEFORE masking (masking prevents later use)
-          PAYLOAD=$(echo $TOKEN | cut -d'.' -f2 | base64 -d 2>/dev/null)
-          echo "=== OIDC Token Claims ==="
-          echo "actor:      $(echo $PAYLOAD | jq -r '.actor')"
-          echo "sub:        $(echo $PAYLOAD | jq -r '.sub')"
-          echo "iss:        $(echo $PAYLOAD | jq -r '.iss')"
-          echo "aud:        $(echo $PAYLOAD | jq -r '.aud')"
-          echo "repository: $(echo $PAYLOAD | jq -r '.repository')"
-          echo "========================="
-
-          # Now mask the full token
-          echo "::add-mask::$TOKEN"
-          echo "SNOWFLAKE_OAUTH_TOKEN=$TOKEN" >> $GITHUB_ENV
-
       - name: Install dbt
         run: pip install dbt-snowflake
 
-      - name: dbt build (DEV via OIDC)
+      - name: dbt deps
+        run: dbt deps || true
+
+      - name: dbt build (CI schema)
         run: dbt build --target ci
 
-  # ---- CD Job: Build to PROD (OIDC auth, no password) ----
+  # ---- CD Job: dbt build to PROD schema (WIF OIDC) ----
   deploy-prod:
     if: ${{ inputs.stage == 'cd' }}
-    name: dbt build to PROD
+    name: dbt build (PROD schema)
     runs-on: ubuntu-latest
+    environment: prod-deploy      # MUST match SUBJECT in Snowflake user
+    permissions:
+      id-token: write
+      contents: read
     env:
       DBT_PROFILES_DIR: .
       SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-      SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
     steps:
       - uses: actions/checkout@v4
+
+      # Snowflake CLI handles OIDC token automatically
+      - name: Setup Snowflake CLI (OIDC)
+        uses: snowflakedb/snowflake-cli-action@v2.0
+        with:
+          use-oidc: true
+          cli-version: "3.14.0"
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ inputs.python-version }}
 
-      # Fetch OIDC token from GitHub and set as env var for dbt
-      - name: Get GitHub OIDC token for Snowflake
-        run: |
-          TOKEN=$(curl -s \
-            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://github.com/bhasinmanish123" \
-            | jq -r '.value')
-          echo "::add-mask::$TOKEN"
-          echo "SNOWFLAKE_OAUTH_TOKEN=$TOKEN" >> $GITHUB_ENV
-
       - name: Install dbt
         run: pip install dbt-snowflake
 
-      - name: dbt build (PROD via OIDC)
+      - name: dbt deps
+        run: dbt deps || true
+
+      - name: dbt build (PROD schema)
         run: dbt build --target prod
