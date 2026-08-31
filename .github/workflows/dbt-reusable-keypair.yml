@@ -1,0 +1,140 @@
+# ============================================================
+# REUSABLE dbt CI/CD workflow — Keypair (JWT) Authentication
+# Flow: CI (on PR) → DEV + PROD (on merge)
+#
+# HOW KEYPAIR WORKS HERE:
+#   1. RSA private key stored as GitHub secret (PEM content)
+#   2. Passed to dbt via SNOWFLAKE_PRIVATE_KEY env var
+#   3. dbt uses authenticator: jwt + private_key to sign JWT
+#   4. Snowflake validates JWT signature using stored public key
+#
+#   stage: ci → lint + dbt build CI schema
+#   stage: cd → dbt build DEV, then PROD (PROD needs DEV)
+# ============================================================
+name: Reusable dbt Keypair CI/CD
+
+on:
+  workflow_call:
+    inputs:
+      stage:
+        description: 'Which stage: ci (lint+build) or cd (dev+prod)'
+        required: true
+        type: string
+      python-version:
+        required: false
+        type: string
+        default: '3.11'
+      dialect:
+        required: false
+        type: string
+        default: 'snowflake'
+    secrets:
+      SNOWFLAKE_ACCOUNT:
+        required: true
+      SNOWFLAKE_PRIVATE_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ============================================================
+  # CI Stage (on PR): Lint + build CI schema
+  # ============================================================
+
+  lint:
+    if: ${{ inputs.stage == 'ci' }}
+    name: Lint YAML + SQL
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+      - name: Install linters
+        run: pip install yamllint sqlfluff
+      - name: YAML Lint
+        run: yamllint -c .yamllint.yml dbt_project.yml profiles.yml
+      - name: SQL Lint
+        run: sqlfluff lint models/ --dialect ${{ inputs.dialect }} --ignore templating
+
+  build-ci:
+    if: ${{ inputs.stage == 'ci' }}
+    name: dbt build (CI schema)
+    needs: [lint]
+    runs-on: ubuntu-latest
+    environment: ci
+    env:
+      DBT_PROFILES_DIR: .
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install dbt
+        run: pip install dbt-snowflake
+
+      - name: dbt deps
+        run: dbt deps || true
+
+      - name: dbt build (CI schema)
+        run: dbt build --target ci
+
+  # ============================================================
+  # CD Stage (on merge): DEV first, then PROD
+  # ============================================================
+
+  deploy-dev:
+    if: ${{ inputs.stage == 'cd' }}
+    name: dbt build (DEV schema)
+    runs-on: ubuntu-latest
+    environment: dev
+    env:
+      DBT_PROFILES_DIR: .
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install dbt
+        run: pip install dbt-snowflake
+
+      - name: dbt deps
+        run: dbt deps || true
+
+      - name: dbt build (DEV schema)
+        run: dbt build --target dev
+
+  deploy-prod:
+    if: ${{ inputs.stage == 'cd' }}
+    name: dbt build (PROD schema)
+    needs: [deploy-dev]              # PROD only runs after DEV succeeds
+    runs-on: ubuntu-latest
+    environment: prod
+    env:
+      DBT_PROFILES_DIR: .
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install dbt
+        run: pip install dbt-snowflake
+
+      - name: dbt deps
+        run: dbt deps || true
+
+      - name: dbt build (PROD schema)
+        run: dbt build --target prod
