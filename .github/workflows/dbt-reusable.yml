@@ -1,10 +1,21 @@
 # ============================================================
-# REUSABLE dbt CI/CD workflow
-# Flow: CI (on PR) → DEV + PROD (on merge)
+# REUSABLE dbt CI/CD workflow — WIF (OIDC)
 #
-#   stage: ci  → lint + dbt build CI schema  (PR validation)
-#   stage: cd  → dbt build DEV schema        (after merge)
-#              → dbt build PROD schema       (after merge)
+# FLOW:
+#   PR opened  (stage: ci):
+#     1. Lint (YAML + SQL)
+#     2. dbt build --target ci
+#        → schema = DEV_<github_username>  (personal, auto-created)
+#        → each developer gets their own isolated schema
+#
+#   Merge to main (stage: cd):
+#     1. dbt build --target prod
+#        → schema = PROD (shared production)
+#
+# WHY NO SHARED CI SCHEMA:
+#   Personal schemas in CI mean each PR is fully isolated.
+#   No collision between developers running at the same time.
+#   Schema auto-created by generate_schema_name macro using GITHUB_ACTOR.
 # ============================================================
 name: Reusable dbt CI/CD
 
@@ -12,7 +23,7 @@ on:
   workflow_call:
     inputs:
       stage:
-        description: 'Which stage: ci (lint+build) or cd (dev+prod)'
+        description: 'Which stage: ci (PR personal schema) or cd (prod deploy)'
         required: true
         type: string
       python-version:
@@ -33,7 +44,8 @@ permissions:
 
 jobs:
   # ============================================================
-  # CI Stage (on PR): Lint + build CI schema
+  # CI Stage (on PR):
+  #   Lint → dbt build in DEV_<github_username> schema
   # ============================================================
 
   lint:
@@ -54,7 +66,7 @@ jobs:
 
   build-ci:
     if: ${{ inputs.stage == 'ci' }}
-    name: dbt build (CI schema — validate)
+    name: dbt build (DEV_${{ github.actor }} schema)
     needs: [lint]
     runs-on: ubuntu-latest
     environment: prod
@@ -64,62 +76,40 @@ jobs:
     env:
       DBT_PROFILES_DIR: .
       SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-      GITHUB_ACTOR: ${{ github.actor }}    # macro uses this → schema = DEV_USERNAME
+      GITHUB_ACTOR: ${{ github.actor }}    # → generate_schema_name macro → DEV_USERNAME
     steps:
       - uses: actions/checkout@v4
+
       - name: Install Snowflake CLI (OIDC)
         uses: snowflakedb/snowflake-actions@v3
         with:
           use-oidc: true
+
       - name: Test Snowflake connection
         run: snow connection test -x
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ inputs.python-version }}
+
       - name: Install dbt
         run: pip install dbt-snowflake
+
       - name: dbt deps
         run: dbt deps || true
-      - name: dbt build (CI schema)
+
+      - name: dbt build → DEV_${{ github.actor }}
         run: dbt build --target ci
 
   # ============================================================
-  # CD Stage (on merge): build DEV first, then PROD
+  # CD Stage (on merge to main):
+  #   dbt build → PROD schema only
+  #   (personal schema already validated in PR above)
   # ============================================================
-
-  deploy-dev:
-    if: ${{ inputs.stage == 'cd' }}
-    name: dbt build (DEV schema)
-    runs-on: ubuntu-latest
-    environment: prod
-    permissions:
-      id-token: write
-      contents: read
-    env:
-      DBT_PROFILES_DIR: .
-      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Snowflake CLI (OIDC)
-        uses: snowflakedb/snowflake-actions@v3
-        with:
-          use-oidc: true
-      - name: Test Snowflake connection
-        run: snow connection test -x
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ inputs.python-version }}
-      - name: Install dbt
-        run: pip install dbt-snowflake
-      - name: dbt deps
-        run: dbt deps || true
-      - name: dbt build (DEV schema)
-        run: dbt build --target dev
 
   deploy-prod:
     if: ${{ inputs.stage == 'cd' }}
     name: dbt build (PROD schema)
-    needs: [deploy-dev]              # PROD only runs after DEV succeeds
     runs-on: ubuntu-latest
     environment: prod
     permissions:
@@ -130,18 +120,24 @@ jobs:
       SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
     steps:
       - uses: actions/checkout@v4
+
       - name: Install Snowflake CLI (OIDC)
         uses: snowflakedb/snowflake-actions@v3
         with:
           use-oidc: true
+
       - name: Test Snowflake connection
         run: snow connection test -x
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ inputs.python-version }}
+
       - name: Install dbt
         run: pip install dbt-snowflake
+
       - name: dbt deps
         run: dbt deps || true
-      - name: dbt build (PROD schema)
+
+      - name: dbt build → PROD
         run: dbt build --target prod
