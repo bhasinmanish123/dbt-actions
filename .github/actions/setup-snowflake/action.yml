@@ -120,6 +120,9 @@ runs:
         if [[ -n "${{ inputs.snowflake-warehouse }}" ]]; then echo "SNOWFLAKE_WAREHOUSE=${{ inputs.snowflake-warehouse }}" >> $GITHUB_ENV; fi
 
     # ---- Step 5: Verify connection ----
+    # GITHUB_ENV vars set in step 3 are available here (separate step)
     - name: Test Snowflake connection
       shell: bash
+      env:
+        SNOWFLAKE_ACCOUNT: ${{ inputs.snowflake-account }}
       run: snow connection test -x
