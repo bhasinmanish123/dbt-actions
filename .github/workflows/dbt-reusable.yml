@@ -64,6 +64,7 @@ jobs:
     env:
       DBT_PROFILES_DIR: .
       SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      GITHUB_ACTOR: ${{ github.actor }}    # macro uses this → schema = DEV_USERNAME
     steps:
       - uses: actions/checkout@v4
       - name: Install Snowflake CLI (OIDC)
