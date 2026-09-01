@@ -1,21 +1,16 @@
 # ============================================================
 # REUSABLE dbt CI/CD workflow — WIF (OIDC)
+# Uses setup-snowflake composite action (same pattern as Helia)
 #
 # FLOW:
 #   PR opened  (stage: ci):
 #     1. Lint (YAML + SQL)
-#     2. dbt build --target ci
-#        → schema = DEV_<github_username>  (personal, auto-created)
-#        → each developer gets their own isolated schema
+#     2. setup-snowflake action → installs CLI, fetches OIDC token
+#     3. dbt build --target ci → DEV_<github_username> (personal schema)
 #
 #   Merge to main (stage: cd):
-#     1. dbt build --target prod
-#        → schema = PROD (shared production)
-#
-# WHY NO SHARED CI SCHEMA:
-#   Personal schemas in CI mean each PR is fully isolated.
-#   No collision between developers running at the same time.
-#   Schema auto-created by generate_schema_name macro using GITHUB_ACTOR.
+#     1. setup-snowflake action → installs CLI, fetches OIDC token
+#     2. dbt build --target prod → PROD schema
 # ============================================================
 name: Reusable dbt CI/CD
 
@@ -44,8 +39,7 @@ permissions:
 
 jobs:
   # ============================================================
-  # CI Stage (on PR):
-  #   Lint → dbt build in DEV_<github_username> schema
+  # CI Stage (on PR): Lint + build DEV_<username> schema
   # ============================================================
 
   lint:
@@ -75,22 +69,16 @@ jobs:
       contents: read
     env:
       DBT_PROFILES_DIR: .
-      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-      GITHUB_ACTOR: ${{ github.actor }}    # → generate_schema_name macro → DEV_USERNAME
+      GITHUB_ACTOR: ${{ github.actor }}    # → generate_schema_name → DEV_USERNAME
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Snowflake CLI (OIDC)
-        uses: snowflakedb/snowflake-actions@v3
+      # ---- Composite action: install CLI + fetch OIDC token + set env vars ----
+      - name: Setup Snowflake (WIF)
+        uses: bhasinmanish123/dbt-actions/.github/actions/setup-snowflake@main
         with:
-          use-oidc: true
-
-      - name: Test Snowflake connection
-        run: snow connection test -x
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ inputs.python-version }}
+          environment: ci
+          snowflake-account: ${{ secrets.SNOWFLAKE_ACCOUNT }}
 
       - name: Install dbt
         run: pip install dbt-snowflake
@@ -102,9 +90,7 @@ jobs:
         run: dbt build --target ci
 
   # ============================================================
-  # CD Stage (on merge to main):
-  #   dbt build → PROD schema only
-  #   (personal schema already validated in PR above)
+  # CD Stage (on merge): build PROD schema
   # ============================================================
 
   deploy-prod:
@@ -117,21 +103,15 @@ jobs:
       contents: read
     env:
       DBT_PROFILES_DIR: .
-      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Snowflake CLI (OIDC)
-        uses: snowflakedb/snowflake-actions@v3
+      # ---- Composite action: install CLI + fetch OIDC token + set env vars ----
+      - name: Setup Snowflake (WIF)
+        uses: bhasinmanish123/dbt-actions/.github/actions/setup-snowflake@main
         with:
-          use-oidc: true
-
-      - name: Test Snowflake connection
-        run: snow connection test -x
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ inputs.python-version }}
+          environment: prod
+          snowflake-account: ${{ secrets.SNOWFLAKE_ACCOUNT }}
 
       - name: Install dbt
         run: pip install dbt-snowflake
